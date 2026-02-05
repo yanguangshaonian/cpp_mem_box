@@ -353,8 +353,7 @@ namespace ipc {
         // ------------------------------------------------------------
         template<class T> class Box {
                 static_assert(std::is_trivially_copyable_v<T>, "T 必须可以安全的复制");
-                static_assert(std::is_base_of_v<Boxed<T>, T>,
-                              "Box<T>: T 必须继承自 ipc::shm::Boxed<T>");
+                static_assert(std::is_base_of_v<Boxed<T>, T>, "Box<T>: T 必须继承自 ipc::shm::Boxed<T>");
 
             private:
                 std::string name_;
@@ -412,12 +411,7 @@ namespace ipc {
                         }
 
                         this->cb_->capacity_bytes.store(init_sz, std::memory_order_relaxed);
-                        diag::write("INFO", "Mount", "初始物理内存已提交: " + std::to_string(init_sz) + " bytes");
-
-                        // 内存屏障 & 签名写入
-                        std::atomic_thread_fence(std::memory_order_release);
-                        this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
-                        diag::write("INFO", "Mount", "签名已写入, 服务就绪");
+                        diag::write("INFO", "Mount", "内存布局已初始化 (等待 Payload 构造)");
 
                     } else {
                         diag::write("INFO", "Mount", "[附加者] 等待控制块签名...");
@@ -458,13 +452,13 @@ namespace ipc {
                     diag::write("INFO", "Box", "打开共享对象: " + this->name_);
 
                     // 尝试原子创建
-                    this->fd_ = shm_open(this->name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0660);
+                    this->fd_ = shm_open(this->name_.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0660);
                     if (this->fd_ >= 0) {
                         is_creator = true;
                         diag::write("INFO", "Box", "原子创建成功 (Owner)");
                     } else if (errno == EEXIST) {
                         diag::write("WARN", "Box", "对象已存在, 尝试 Attach...");
-                        this->fd_ = shm_open(this->name_.c_str(), O_RDWR, 0660);
+                        this->fd_ = shm_open(this->name_.c_str(), O_RDWR | O_CLOEXEC, 0660);
                         if (this->fd_ < 0) {
                             diag::write("ERROR", "Box", "Attach 失败: " + std::string(strerror(errno)));
                             return false;
@@ -484,8 +478,10 @@ namespace ipc {
                     }
 
                     if (is_creator) {
-                        diag::write("INFO", "Box", "构造 Payload 对象...");
                         new (this->payload_) T(std::forward<Args>(args)...);
+                        std::atomic_thread_fence(std::memory_order_release);
+                        this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
+                        diag::write("INFO", "Box", "Payload 构造完成，服务已发布 (Signature Written)");
                     }
                     return true;
                 }
