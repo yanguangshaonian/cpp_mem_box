@@ -38,7 +38,7 @@ namespace ipc {
             static thread_local int cached_pid = 0;
             static thread_local int cached_tid = 0;
 
-            // 分支预测优化：只会进入一次系统调用
+            // 分支预测优化: 只会进入一次系统调用
             if (__builtin_expect(cached_pid == 0, 0)) {
                 cached_pid = getpid();
                 cached_tid = static_cast<int>(gettid()); // 依赖 _GNU_SOURCE
@@ -60,8 +60,9 @@ namespace ipc {
         }
 
         // 高性能日志写入 (Direct Syscall Write)
-        __attribute__((always_inline)) inline void write(const char* level, const std::string& module, const std::string& msg) {
-            char buffer[1024]; // 栈上分配，避免 malloc
+        __attribute__((always_inline)) inline void write(const char* level, const std::string& module,
+                                                         const std::string& msg) {
+            char buffer[1024];
             char time_buf[32];
             char tid_buf[32];
 
@@ -79,7 +80,7 @@ namespace ipc {
                 len = sizeof(buffer) - 1;
             }
 
-            // 自旋锁临界区：极短，仅包含 write 系统调用
+            // 自旋锁临界区: 极短, 仅包含 write 系统调用
             while (log_spinlock.test_and_set(std::memory_order_acquire)) {
                 _mm_pause();
             }
@@ -149,13 +150,13 @@ namespace ipc {
                                 diag::write("WARN", "LockGuard", "正在恢复锁的一致性 (consistent)...");
 
                                 if (pthread_mutex_consistent(&this->lock_->handle) != 0) {
-                                    diag::write("FATAL", "LockGuard", "锁恢复失败!");
+                                    diag::write("ERROR", "LockGuard", "锁恢复失败!");
                                     throw std::runtime_error("RobustLock recovery failed");
                                 }
                                 this->acquired_ = true;
-                                diag::write("INFO", "LockGuard", "锁已恢复，继续执行");
+                                diag::write("INFO", "LockGuard", "锁已恢复, 继续执行");
                             } else if (ret == ENOTRECOVERABLE) {
-                                diag::write("FATAL", "LockGuard", "锁状态不可恢复");
+                                diag::write("ERROR", "LockGuard", "锁状态不可恢复");
                                 throw std::runtime_error("RobustLock ENOTRECOVERABLE");
                             } else {
                                 diag::write("ERROR", "LockGuard", "加锁失败: " + std::to_string(ret));
@@ -213,10 +214,11 @@ namespace ipc {
                     this->mappings_.erase(end);
                 }
 
-                 __attribute__((always_inline)) inline bool find_mapping_fast(void* ptr, RegionDescriptor* out_desc, RegionDescriptor* cache_hint) {
+                __attribute__((always_inline)) inline bool find_mapping_fast(void* ptr, RegionDescriptor* out_desc,
+                                                                             RegionDescriptor* cache_hint) {
                     uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
 
-                    // 1. Fast Path: TLS Cache
+                    // Fast Path: TLS Cache
                     if (cache_hint && cache_hint->base) {
                         uintptr_t start = reinterpret_cast<uintptr_t>(cache_hint->base);
                         uintptr_t end = start + cache_hint->v_size;
@@ -226,7 +228,7 @@ namespace ipc {
                         }
                     }
 
-                    // 2. Slow Path: Map Lookup
+                    // Slow Path: Map Lookup
                     std::shared_lock lock(this->rw_lock_);
                     auto it = this->mappings_.upper_bound(p);
 
@@ -264,7 +266,7 @@ namespace ipc {
         // ------------------------------------------------------------
         class PageCommitter {
             public:
-                static  __attribute__((always_inline)) inline bool commit(void* payload_ptr, uint64_t required_bytes) {
+                static __attribute__((always_inline)) inline bool commit(void* payload_ptr, uint64_t required_bytes) {
                     static thread_local RegionDescriptor tls_desc = {0, nullptr, 0};
                     RegionDescriptor desc;
 
@@ -277,12 +279,12 @@ namespace ipc {
                     auto* cb = reinterpret_cast<ControlBlock*>(desc.base);
                     uint64_t total_needed = cb->payload_offset + required_bytes;
 
-                    // 1. 乐观无锁检查 (Acquire)
+                    // 乐观无锁检查 (Acquire)
                     if (cb->capacity_bytes.load(std::memory_order_acquire) >= total_needed) {
                         return true;
                     }
 
-                    // 2. 加锁扩容 (悲观路径)
+                    // 加锁扩容 (悲观路径)
                     RobustLock::ScopedGuard guard(&cb->extend_lock);
 
                     // Double Check
@@ -310,11 +312,49 @@ namespace ipc {
         };
 
         // ------------------------------------------------------------
+        // 共享对象基类 (CRTP)
+        // ------------------------------------------------------------
+        template<typename Derived> class Boxed {
+            protected:
+                Boxed() {
+#ifndef NDEBUG
+                    RegionDescriptor desc;
+                    if (!MappingRegistry::instance().find_mapping_fast(this, &desc, nullptr)) {
+                        diag::write("ERROR", "ShmBase", "对象未位于托管的共享内存区域内");
+                        std::abort();
+                    }
+#endif
+                }
+
+                ~Boxed() = default;
+
+            public:
+                // 必须通过 Box 的 Placement New 在共享内存上创建
+                void* operator new(size_t) = delete;
+                void* operator new[](size_t) = delete;
+                void operator delete(void*) = delete;
+                void operator delete[](void*) = delete;
+
+                // Placement New (Box 专用通道)
+                void* operator new(size_t, void* ptr) {
+                    return ptr;
+                }
+
+                void operator delete(void*, void*) {}
+
+                // 自我扩容
+                __attribute__((always_inline)) inline bool grow_storage(uint64_t bytes_needed) {
+                    return PageCommitter::commit(static_cast<Derived*>(this), bytes_needed);
+                }
+        };
+
+        // ------------------------------------------------------------
         // 共享对象 (Box Object)
         // ------------------------------------------------------------
-        template<class T>
-        class Box {
-                static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+        template<class T> class Box {
+                static_assert(std::is_trivially_copyable_v<T>, "T 必须可以安全的复制");
+                static_assert(std::is_base_of_v<Boxed<T>, T>,
+                              "Box<T>: T 必须继承自 ipc::shm::Boxed<T>");
 
             private:
                 std::string name_;
@@ -363,7 +403,8 @@ namespace ipc {
                         this->cb_->payload_offset = detail::align_up(sizeof(ControlBlock), alignof(T));
 
                         // 初始提交
-                        uint64_t init_sz = detail::align_up(this->cb_->payload_offset + sizeof(T), this->cb_->page_size);
+                        uint64_t init_sz =
+                            detail::align_up(this->cb_->payload_offset + sizeof(T), this->cb_->page_size);
 
                         if (ftruncate(this->fd_, init_sz) != 0) {
                             diag::write("ERROR", "Mount", "初始 ftruncate 失败");
@@ -376,7 +417,7 @@ namespace ipc {
                         // 内存屏障 & 签名写入
                         std::atomic_thread_fence(std::memory_order_release);
                         this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
-                        diag::write("INFO", "Mount", "签名已写入，服务就绪");
+                        diag::write("INFO", "Mount", "签名已写入, 服务就绪");
 
                     } else {
                         diag::write("INFO", "Mount", "[附加者] 等待控制块签名...");
@@ -397,7 +438,7 @@ namespace ipc {
                             }
                             spins += 1;
                         }
-                        diag::write("INFO", "Mount", "签名校验通过，连接成功");
+                        diag::write("INFO", "Mount", "签名校验通过, 连接成功");
                     }
 
                     this->payload_ = reinterpret_cast<T*>(this->base_ + this->cb_->payload_offset);
@@ -422,7 +463,7 @@ namespace ipc {
                         is_creator = true;
                         diag::write("INFO", "Box", "原子创建成功 (Owner)");
                     } else if (errno == EEXIST) {
-                        diag::write("WARN", "Box", "对象已存在，尝试 Attach...");
+                        diag::write("WARN", "Box", "对象已存在, 尝试 Attach...");
                         this->fd_ = shm_open(this->name_.c_str(), O_RDWR, 0660);
                         if (this->fd_ < 0) {
                             diag::write("ERROR", "Box", "Attach 失败: " + std::string(strerror(errno)));
@@ -437,9 +478,7 @@ namespace ipc {
                     if (!mount_region(is_creator, mode)) {
                         close(this->fd_);
                         if (is_creator) {
-                            {
-                                shm_unlink(this->name_.c_str());
-                            }
+                            { shm_unlink(this->name_.c_str()); }
                         }
                         return false;
                     }
@@ -449,13 +488,6 @@ namespace ipc {
                         new (this->payload_) T(std::forward<Args>(args)...);
                     }
                     return true;
-                }
-
-                // --------------------------------------------------------
-                // API: 提交物理内存 (Commit)
-                // --------------------------------------------------------
-                 __attribute__((always_inline)) inline bool commit(uint64_t used_bytes) {
-                    return PageCommitter::commit(this->payload_, used_bytes);
                 }
 
                 // --------------------------------------------------------
@@ -486,3 +518,59 @@ namespace ipc {
     } // namespace shm
 } // namespace ipc
 #endif // IPC_SHM_BOX_HPP
+
+
+/*
+透明的扩容, 智能句柄
+
+namespace ipc {
+namespace shm {
+
+    template <typename T>
+    class ShmHandle {
+    private:
+        T* ptr_; // 仅持有一个指针，sizeof(ShmHandle) == 8 bytes
+
+    public:
+        // 构造函数
+        explicit ShmHandle(T* p) : ptr_(p) {}
+
+        // 1. 像指针一样访问成员 (零开销)
+        __attribute__((always_inline)) T* operator->() { return ptr_; }
+        __attribute__((always_inline)) const T* operator->() const { return ptr_; }
+        __attribute__((always_inline)) T& operator*() { return *ptr_; }
+
+        // 2. 核心功能：扩容
+        // 返回 true 表示成功，false 表示失败
+        bool resize(uint64_t required_bytes) {
+            // 直接调用底层 PageCommitter
+            return PageCommitter::commit(ptr_, required_bytes);
+        }
+
+        // 3. 允许隐式转换为裸指针 T*
+        // 这样你可以把 handle 直接传给接受 T* 的老函数
+        operator T*() { return ptr_; }
+        operator const T*() const { return ptr_; }
+
+        // 获取裸指针（显式）
+        T* get() { return ptr_; }
+    };
+
+} // namespace shm
+} // namespace ipc
+
+
+
+template<class T>
+class Box {
+    // ... 原有代码 ...
+
+public:
+    // ... 原有代码 ...
+
+    // 新增：获取智能句柄
+    ShmHandle<T> handle() {
+        return ShmHandle<T>(this->payload_);
+    }
+};
+*/
