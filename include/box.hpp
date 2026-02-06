@@ -314,7 +314,8 @@ namespace ipc {
         // ------------------------------------------------------------
         // 共享对象基类 (CRTP)
         // ------------------------------------------------------------
-        template<typename Derived> class Boxed {
+        template<typename Derived>
+        class Boxed {
             protected:
                 Boxed() {
 #ifndef NDEBUG
@@ -351,7 +352,8 @@ namespace ipc {
         // ------------------------------------------------------------
         // 共享对象 (Box Object)
         // ------------------------------------------------------------
-        template<class T> class Box {
+        template<class T>
+        class Box {
                 static_assert(std::is_trivially_copyable_v<T>, "T 必须可以安全的复制");
                 static_assert(std::is_base_of_v<Boxed<T>, T>, "Box<T>: T 必须继承自 ipc::shm::Boxed<T>");
 
@@ -362,80 +364,89 @@ namespace ipc {
                 ControlBlock* cb_ = nullptr;
                 T* payload_ = nullptr;
 
+                // 内部函数: 挂载逻辑 (事务性修复版)
                 bool mount_region(bool is_creator, InitMode mode) {
-                    diag::write("INFO", "Mount",
-                                "映射虚拟地址空间 (" + std::to_string(VIRTUAL_RESERVATION_SIZE / 1024 / 1024 / 1024) +
-                                    "GB)...");
+                    diag::write("INFO", "Mount", "映射虚拟地址空间...");
+                    // 使用局部变量持有资源, 绝不污染 this->base_
+                    void* temp_ptr =
+                        mmap(nullptr, VIRTUAL_RESERVATION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd_, 0);
 
-                    int prot = PROT_READ | PROT_WRITE; // 总是读写
-                    void* ptr = mmap(nullptr, VIRTUAL_RESERVATION_SIZE, prot, MAP_SHARED, this->fd_, 0);
-
-                    if (ptr == MAP_FAILED) {
+                    if (temp_ptr == MAP_FAILED) {
                         diag::write("ERROR", "Mount", "mmap 失败: " + std::string(strerror(errno)));
                         return false;
                     }
 
-                    this->base_ = static_cast<uint8_t*>(ptr);
-                    this->cb_ = reinterpret_cast<ControlBlock*>(base_);
+                    uint8_t* temp_base = static_cast<uint8_t*>(temp_ptr);
+                    auto* temp_cb = reinterpret_cast<ControlBlock*>(temp_base);
+                    bool success = false;
 
-                    if (is_creator) {
-                        diag::write("INFO", "Mount", "[创建者] 初始化控制块 (ControlBlock)...");
+                    // 使用 do-while(0) 结构统一管理错误跳出
+                    do {
+                        if (is_creator) {
+                            diag::write("INFO", "Mount", "[创建者] 初始化控制块...");
+                            try {
+                                temp_cb->extend_lock.init();
+                            } catch (const std::exception& e) {
+                                diag::write("ERROR", "Mount", "锁初始化失败... " + std::string(e.what()));
+                                break; // 跳出，执行 munmap
+                            }
 
-                        this->cb_->extend_lock.init();
+                            uint64_t sys_page = sysconf(_SC_PAGESIZE);
+                            uint64_t huge_page = 2 * 1024 * 1024;
+                            bool use_huge = (mode == InitMode::ForceLarge);
 
-                        uint64_t sys_page = sysconf(_SC_PAGESIZE);
-                        uint64_t huge_page = 2 * 1024 * 1024;
-                        bool use_huge = (mode == InitMode::ForceLarge);
-
-                        // 建议内核使用透明大页
-                        if (use_huge) {
-                            madvise(ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
-                            this->cb_->page_size = huge_page;
-                            diag::write("INFO", "Mount", "启用大页模式 (HugePage 2MB)");
-                        } else {
-                            madvise(ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
-                            this->cb_->page_size = sys_page;
-                            diag::write("INFO", "Mount", "使用标准页模式 (4KB)");
-                        }
-
-                        // 计算 Payload 偏移
-                        this->cb_->payload_offset = detail::align_up(sizeof(ControlBlock), alignof(T));
-
-                        // 初始提交
-                        uint64_t init_sz =
-                            detail::align_up(this->cb_->payload_offset + sizeof(T), this->cb_->page_size);
-
-                        if (ftruncate(this->fd_, init_sz) != 0) {
-                            diag::write("ERROR", "Mount", "初始 ftruncate 失败");
-                            return false;
-                        }
-
-                        this->cb_->capacity_bytes.store(init_sz, std::memory_order_relaxed);
-                        diag::write("INFO", "Mount", "内存布局已初始化 (等待 Payload 构造)");
-
-                    } else {
-                        diag::write("INFO", "Mount", "[附加者] 等待控制块签名...");
-
-                        int spins = 0;
-                        while (this->cb_->signature.load(std::memory_order_acquire) != IPC_SHM_SIGNATURE) {
-                            if (spins < 1000) {
-                                _mm_pause();
-                            } else if (spins < 3000) {
-                                std::this_thread::yield();
+                            if (use_huge) {
+                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
+                                temp_cb->page_size = huge_page;
                             } else {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
+                                temp_cb->page_size = sys_page;
                             }
 
-                            if (spins > 5000) {
-                                diag::write("ERROR", "Mount", "等待签名超时 (>5s)");
-                                return false;
+                            temp_cb->payload_offset = detail::align_up(sizeof(ControlBlock), alignof(T));
+                            uint64_t init_sz =
+                                detail::align_up(temp_cb->payload_offset + sizeof(T), temp_cb->page_size);
+
+                            if (ftruncate(this->fd_, init_sz) != 0) {
+                                diag::write("ERROR", "Mount", "初始 ftruncate 失败");
+                                break;
                             }
-                            spins += 1;
+                            temp_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
+                        } else {
+                            diag::write("INFO", "Mount", "[附加者] 等待签名...");
+                            int spins = 0;
+                            while (temp_cb->signature.load(std::memory_order_acquire) != IPC_SHM_SIGNATURE) {
+                                if (spins < 1000)
+                                    _mm_pause();
+                                else if (spins < 3000)
+                                    std::this_thread::yield();
+                                else
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+                                if (spins > 5000) {
+                                    diag::write("ERROR", "Mount", "等待签名超时");
+                                    break;
+                                }
+                                spins += 1;
+                            }
+                            if (temp_cb->signature.load(std::memory_order_relaxed) != IPC_SHM_SIGNATURE) {
+                                break;
+                            }
                         }
-                        diag::write("INFO", "Mount", "签名校验通过, 连接成功");
+                        success = true;
+                    } while (0);
+
+                    if (!success) {
+                        // 事务回滚: 释放刚才申请的 mmap
+                        munmap(temp_base, VIRTUAL_RESERVATION_SIZE);
+                        return false;
                     }
 
+                    // 事务提交: 一切成功后, 才赋值给成员变量
+                    this->base_ = temp_base;
+                    this->cb_ = temp_cb;
                     this->payload_ = reinterpret_cast<T*>(this->base_ + this->cb_->payload_offset);
+
                     MappingRegistry::instance().register_mapping(this->base_, VIRTUAL_RESERVATION_SIZE, this->fd_);
                     return true;
                 }
@@ -446,6 +457,10 @@ namespace ipc {
                 // --------------------------------------------------------
                 template<typename... Args>
                 bool attach_or_create(const std::string& name, InitMode mode = InitMode::ForceLarge, Args&&... args) {
+                    if (this->fd_ >= 0 || this->base_ != nullptr) {
+                        diag::write("ERROR", "Box", "Box 已经处于 Open 状态，请先析构或重置");
+                        return false;
+                    }
                     this->name_ = name;
                     bool is_creator = false;
 
@@ -471,17 +486,25 @@ namespace ipc {
 
                     if (!mount_region(is_creator, mode)) {
                         close(this->fd_);
+                        this->fd_ = -1;
                         if (is_creator) {
-                            { shm_unlink(this->name_.c_str()); }
+                            shm_unlink(this->name_.c_str());
                         }
                         return false;
                     }
 
                     if (is_creator) {
-                        new (this->payload_) T(std::forward<Args>(args)...);
+                        try {
+                            new (this->payload_) T(std::forward<Args>(args)...);
+                        } catch (const std::exception& e) {
+                            diag::write("ERROR", "Box",
+                                        "Payload 构造函数抛出异常! 回滚资源... " + std::string(e.what()));
+                            shm_unlink(this->name_.c_str());
+                            throw;
+                        }
                         std::atomic_thread_fence(std::memory_order_release);
                         this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
-                        diag::write("INFO", "Box", "Payload 构造完成，服务已发布 (Signature Written)");
+                        diag::write("INFO", "Box", "Payload 构造完成, 服务已发布 (Signature Written)");
                     }
                     return true;
                 }
@@ -525,7 +548,7 @@ namespace shm {
     template <typename T>
     class ShmHandle {
     private:
-        T* ptr_; // 仅持有一个指针，sizeof(ShmHandle) == 8 bytes
+        T* ptr_; // 仅持有一个指针, sizeof(ShmHandle) == 8 bytes
 
     public:
         // 构造函数
@@ -536,8 +559,8 @@ namespace shm {
         __attribute__((always_inline)) const T* operator->() const { return ptr_; }
         __attribute__((always_inline)) T& operator*() { return *ptr_; }
 
-        // 2. 核心功能：扩容
-        // 返回 true 表示成功，false 表示失败
+        // 2. 核心功能: 扩容
+        // 返回 true 表示成功, false 表示失败
         bool resize(uint64_t required_bytes) {
             // 直接调用底层 PageCommitter
             return PageCommitter::commit(ptr_, required_bytes);
@@ -564,7 +587,7 @@ class Box {
 public:
     // ... 原有代码 ...
 
-    // 新增：获取智能句柄
+    // 新增: 获取智能句柄
     ShmHandle<T> handle() {
         return ShmHandle<T>(this->payload_);
     }
