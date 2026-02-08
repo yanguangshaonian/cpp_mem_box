@@ -35,11 +35,11 @@ namespace ipc {
 
         // 获取线程身份标识 [PID:TID]
         __attribute__((always_inline)) inline void format_thread_id(char* buf, size_t size) {
-            static thread_local int cached_pid = 0;
-            static thread_local int cached_tid = 0;
+            static thread_local auto cached_pid = 0;
+            static thread_local auto cached_tid = 0;
 
             // 分支预测优化: 只会进入一次系统调用
-            if (__builtin_expect(cached_pid == 0, 0)) {
+            if (__builtin_expect(static_cast<int64_t>(cached_pid == 0), 0) != 0) {
                 cached_pid = getpid();
                 cached_tid = static_cast<int>(gettid()); // 依赖 _GNU_SOURCE
             }
@@ -53,7 +53,7 @@ namespace ipc {
             struct tm tm_info;
             localtime_r(&ts.tv_sec, &tm_info);
 
-            int len = strftime(buf, size, "%T", &tm_info);
+            auto len = strftime(buf, size, "%T", &tm_info);
             if (len > 0 && (size_t) len < size) {
                 snprintf(buf + len, size - len, ".%03ld", ts.tv_nsec / 1000000);
             }
@@ -70,8 +70,8 @@ namespace ipc {
             format_thread_id(tid_buf, sizeof(tid_buf));
 
             // 格式化: [Time] [PID:TID] [LEVEL] [Module] Message
-            int len = snprintf(buffer, sizeof(buffer), "[%s] %s [%s] [%s] %s\n", time_buf, tid_buf, level,
-                               module.c_str(), msg.c_str());
+            auto len = snprintf(buffer, sizeof(buffer), "[%s] %s [%s] [%s] %s\n", time_buf, tid_buf, level,
+                                module.c_str(), msg.c_str());
 
             // 截断保护
             if (len >= (int) sizeof(buffer)) {
@@ -125,7 +125,7 @@ namespace ipc {
                     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
                     pthread_mutex_init(&this->handle, &attr);
 
-                    int ret = pthread_mutexattr_destroy(&attr);
+                    auto ret = pthread_mutexattr_destroy(&attr);
                     if (ret != 0) {
                         diag::write("ERROR", "RobustLock", "属性销毁失败: " + std::to_string(ret));
                         throw std::system_error(ret, std::generic_category());
@@ -142,7 +142,7 @@ namespace ipc {
                     public:
                         explicit ScopedGuard(RobustLock* l)
                             : lock_(l) {
-                            int ret = pthread_mutex_lock(&this->lock_->handle);
+                            auto ret = pthread_mutex_lock(&this->lock_->handle);
                             if (ret == 0) {
                                 this->acquired_ = true;
                             } else if (ret == EOWNERDEAD) {
@@ -177,7 +177,7 @@ namespace ipc {
         // ------------------------------------------------------------
         class RegionDescriptor {
             public:
-                int fd;
+                int32_t fd;
                 uint8_t* base;
                 uint64_t v_size;
         };
@@ -202,7 +202,7 @@ namespace ipc {
                     return inst;
                 }
 
-                void register_mapping(uint8_t* base, uint64_t size, int fd) {
+                void register_mapping(uint8_t* base, uint64_t size, int32_t fd) {
                     std::unique_lock lock(this->rw_lock_);
                     uintptr_t end = reinterpret_cast<uintptr_t>(base) + size;
                     this->mappings_[end] = {fd, base, size};
@@ -219,7 +219,7 @@ namespace ipc {
                     uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
 
                     // Fast Path: TLS Cache
-                    if (cache_hint && cache_hint->base) {
+                    if (cache_hint != nullptr && cache_hint->base != nullptr) {
                         uintptr_t start = reinterpret_cast<uintptr_t>(cache_hint->base);
                         uintptr_t end = start + cache_hint->v_size;
                         if (p >= start && p < end) {
@@ -236,7 +236,7 @@ namespace ipc {
                         uintptr_t base = reinterpret_cast<uintptr_t>(it->second.base);
                         if (p >= base) {
                             *out_desc = it->second;
-                            if (cache_hint) {
+                            if (cache_hint != nullptr) {
                                 *cache_hint = it->second;
                             }
                             return true;
@@ -249,8 +249,8 @@ namespace ipc {
         // ------------------------------------------------------------
         // 内存控制块 (Control Block)
         // ------------------------------------------------------------
-        static constexpr uint64_t IPC_SHM_SIGNATURE = 0xABCDEFABCDEF1996;
-        static constexpr uint64_t VIRTUAL_RESERVATION_SIZE = 128ULL * 1024 * 1024 * 1024; // 128GB
+        static constexpr auto IPC_SHM_SIGNATURE = 0xABCDEFABCDEF1996;
+        static constexpr auto VIRTUAL_RESERVATION_SIZE = 128ULL * 1024 * 1024 * 1024; // 128GB
 
         class alignas(256) ControlBlock {
             public:
@@ -277,7 +277,7 @@ namespace ipc {
                     }
 
                     auto* cb = reinterpret_cast<ControlBlock*>(desc.base);
-                    uint64_t total_needed = cb->payload_offset + required_bytes;
+                    auto total_needed = cb->payload_offset + required_bytes;
 
                     // 乐观无锁检查 (Acquire)
                     if (cb->capacity_bytes.load(std::memory_order_acquire) >= total_needed) {
@@ -288,14 +288,14 @@ namespace ipc {
                     RobustLock::ScopedGuard guard(&cb->extend_lock);
 
                     // Double Check
-                    uint64_t current_cap = cb->capacity_bytes.load(std::memory_order_relaxed);
+                    auto current_cap = cb->capacity_bytes.load(std::memory_order_relaxed);
                     if (current_cap >= total_needed) {
                         return true;
                     }
 
                     // 计算对齐
-                    uint64_t align = cb->page_size ? cb->page_size : 4096;
-                    uint64_t new_cap = detail::align_up(total_needed, align);
+                    auto align = cb->page_size != 0 ? cb->page_size : 4096;
+                    auto new_cap = detail::align_up(total_needed, align);
 
                     diag::write("INFO", "Committer",
                                 "扩展物理内存: " + std::to_string(current_cap) + " -> " + std::to_string(new_cap));
@@ -359,7 +359,7 @@ namespace ipc {
 
             private:
                 std::string name_;
-                int fd_ = -1;
+                int32_t fd_ = -1;
                 uint8_t* base_ = nullptr;
                 ControlBlock* cb_ = nullptr;
                 T* payload_ = nullptr;
@@ -391,8 +391,8 @@ namespace ipc {
                                 break; // 跳出，执行 munmap
                             }
 
-                            uint64_t sys_page = sysconf(_SC_PAGESIZE);
-                            uint64_t huge_page = 2 * 1024 * 1024;
+                            auto sys_page = sysconf(_SC_PAGESIZE);
+                            constexpr auto huge_page = 1024 * 1024 * 2;
                             bool use_huge = (mode == InitMode::ForceLarge);
 
                             if (use_huge) {
@@ -404,17 +404,16 @@ namespace ipc {
                             }
 
                             temp_cb->payload_offset = detail::align_up(sizeof(ControlBlock), alignof(T));
-                            uint64_t init_sz =
-                                detail::align_up(temp_cb->payload_offset + sizeof(T), temp_cb->page_size);
+                            auto init_sz = detail::align_up(temp_cb->payload_offset + sizeof(T), temp_cb->page_size);
 
-                            if (ftruncate(this->fd_, init_sz) != 0) {
+                            if (ftruncate(this->fd_, static_cast<int64_t>(init_sz)) != 0) {
                                 diag::write("ERROR", "Mount", "初始 ftruncate 失败");
                                 break;
                             }
                             temp_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
                         } else {
                             diag::write("INFO", "Mount", "[附加者] 等待签名...");
-                            int spins = 0;
+                            auto spins = 0;
                             while (temp_cb->signature.load(std::memory_order_acquire) != IPC_SHM_SIGNATURE) {
                                 if (spins < 1000)
                                     _mm_pause();
@@ -434,7 +433,7 @@ namespace ipc {
                             }
                         }
                         success = true;
-                    } while (0);
+                    } while (false);
 
                     if (!success) {
                         // 事务回滚: 释放刚才申请的 mmap
@@ -497,11 +496,15 @@ namespace ipc {
                         try {
                             new (this->payload_) T(std::forward<Args>(args)...);
                         } catch (const std::exception& e) {
-                            diag::write("ERROR", "Box",
-                                        "Payload 构造函数抛出异常! 回滚资源... " + std::string(e.what()));
+                            diag::write("ERROR", "Box", "Payload 构造异常(std): " + std::string(e.what()));
+                            shm_unlink(this->name_.c_str());
+                            throw;
+                        } catch (...) {
+                            diag::write("ERROR", "Box", "Payload 构造异常(unknown)!");
                             shm_unlink(this->name_.c_str());
                             throw;
                         }
+
                         std::atomic_thread_fence(std::memory_order_release);
                         this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
                         diag::write("INFO", "Box", "Payload 构造完成, 服务已发布 (Signature Written)");
@@ -525,7 +528,7 @@ namespace ipc {
                 }
 
                 ~Box() {
-                    if (this->base_) {
+                    if (this->base_ != nullptr) {
                         MappingRegistry::instance().unregister_mapping(this->base_, VIRTUAL_RESERVATION_SIZE);
                         munmap(this->base_, VIRTUAL_RESERVATION_SIZE);
                     }
