@@ -83,10 +83,11 @@ namespace ipc {
             }
 
             // 自旋锁临界区: 极短, 仅包含 write 系统调用
-            while (log_spinlock.test_and_set(std::memory_order_acquire)) {
-                _mm_pause();
-            }
-            (void) ::write(STDOUT_FILENO, buffer, len);
+            // while (log_spinlock.test_and_set(std::memory_order_acquire)) {
+            //     _mm_pause();
+            // }
+            ssize_t ignored = ::write(STDOUT_FILENO, buffer, len);
+            (void) ignored;
             log_spinlock.clear(std::memory_order_release);
         }
     } // namespace diag
@@ -216,19 +217,8 @@ namespace ipc {
                     this->mappings_.erase(end);
                 }
 
-                __attribute__((always_inline)) inline bool find_mapping_fast(void* ptr, RegionDescriptor* out_desc,
-                                                                             RegionDescriptor* cache_hint) {
+                __attribute__((always_inline)) inline bool find_mapping_fast(void* ptr, RegionDescriptor* out_desc) {
                     auto p = reinterpret_cast<uintptr_t>(ptr);
-
-                    // Fast Path: TLS Cache
-                    if (cache_hint != nullptr && cache_hint->base != nullptr) {
-                        auto start = reinterpret_cast<uintptr_t>(cache_hint->base);
-                        auto end = start + cache_hint->v_size;
-                        if (p >= start && p < end) {
-                            *out_desc = *cache_hint;
-                            return true;
-                        }
-                    }
 
                     // Slow Path: Map Lookup
                     std::shared_lock lock(this->rw_lock_);
@@ -238,9 +228,6 @@ namespace ipc {
                         auto base = reinterpret_cast<uintptr_t>(it->second.base);
                         if (p >= base) {
                             *out_desc = it->second;
-                            if (cache_hint != nullptr) {
-                                *cache_hint = it->second;
-                            }
                             return true;
                         }
                     }
@@ -273,11 +260,9 @@ namespace ipc {
         class PageCommitter {
             public:
                 static __attribute__((always_inline)) inline bool commit(void* payload_ptr, uint64_t required_bytes) {
-                    static thread_local RegionDescriptor tls_desc = {0, nullptr, 0};
                     RegionDescriptor desc;
-
                     // 查找指针所属区域
-                    if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc, &tls_desc)) {
+                    if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc)) {
                         diag::write("ERROR", "Committer", "Commit失败: 指针未受管辖");
                         return false;
                     }
@@ -325,7 +310,7 @@ namespace ipc {
             protected:
                 Boxed() {
                     RegionDescriptor desc;
-                    if (!MappingRegistry::instance().find_mapping_fast(this, &desc, nullptr)) {
+                    if (!MappingRegistry::instance().find_mapping_fast(this, &desc)) {
                         diag::write("ERROR", "ShmBase", "对象未位于托管的共享内存区域内");
                         std::abort();
                     }
