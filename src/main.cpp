@@ -12,21 +12,20 @@
 
 using namespace std;
 
-template<class T>
-class alignas(64) MyVec {
-    uint64_t VEC_MAGIC = 0x20260205;
-    private:
+class MyObj : public ipc::shm::Boxed<MyObj> {
     public:
-        uint64_t magic;
-        uint64_t current_size;
-        uint64_t capacity;
-        T data[];
-
-        
+        uint32_t age;
+        char name[20];
 };
-
 
 int main(const int argc, char* argv[]) {
 
-    cout << "hello" << endl;
+    auto my_obj = ipc::shm::Box<MyObj>{};
+    my_obj.attach_or_create("my_obj");
+    my_obj->grow_storage(sizeof(MyObj));
+
+    my_obj->age += 1;
+    // strcpy(my_obj->name, "小明");
+
+    cout << "hello " << my_obj->name << ", age " << my_obj->age << endl;
 }

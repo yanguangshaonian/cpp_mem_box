@@ -84,7 +84,7 @@ namespace ipc {
             while (log_spinlock.test_and_set(std::memory_order_acquire)) {
                 _mm_pause();
             }
-            ::write(STDOUT_FILENO, buffer, len);
+            (void) ::write(STDOUT_FILENO, buffer, len);
             log_spinlock.clear(std::memory_order_release);
         }
     } // namespace diag
@@ -279,12 +279,12 @@ namespace ipc {
                     auto* cb = reinterpret_cast<ControlBlock*>(desc.base);
                     auto total_needed = cb->payload_offset + required_bytes;
 
-                    // 乐观无锁检查 (Acquire)
+                    // 无锁检查
                     if (cb->capacity_bytes.load(std::memory_order_acquire) >= total_needed) {
                         return true;
                     }
 
-                    // 加锁扩容 (悲观路径)
+                    // 加锁扩容
                     RobustLock::ScopedGuard guard(&cb->extend_lock);
 
                     // Double Check
@@ -305,7 +305,7 @@ namespace ipc {
                         return false;
                     }
 
-                    // 提交新容量 (Release)
+                    // 提交新容量
                     cb->capacity_bytes.store(new_cap, std::memory_order_release);
                     return true;
                 }
@@ -318,13 +318,11 @@ namespace ipc {
         class Boxed {
             protected:
                 Boxed() {
-#ifndef NDEBUG
                     RegionDescriptor desc;
                     if (!MappingRegistry::instance().find_mapping_fast(this, &desc, nullptr)) {
                         diag::write("ERROR", "ShmBase", "对象未位于托管的共享内存区域内");
                         std::abort();
                     }
-#endif
                 }
 
                 ~Boxed() = default;
@@ -367,7 +365,7 @@ namespace ipc {
                 // 内部函数: 挂载逻辑 (事务性修复版)
                 bool mount_region(bool is_creator, InitMode mode) {
                     diag::write("INFO", "Mount", "映射虚拟地址空间...");
-                    // 使用局部变量持有资源, 绝不污染 this->base_
+                    // 使用局部变量持有资源, 防止污染 this->base_
                     void* temp_ptr =
                         mmap(nullptr, VIRTUAL_RESERVATION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd_, 0);
 
@@ -384,6 +382,27 @@ namespace ipc {
                     do {
                         if (is_creator) {
                             diag::write("INFO", "Mount", "[创建者] 初始化控制块...");
+
+                            auto sys_page = sysconf(_SC_PAGESIZE);
+                            constexpr auto huge_page = 1024 * 1024 * 2; // 2MB
+                            bool use_huge = (mode == InitMode::ForceLarge);
+                            uint64_t target_page_size = use_huge ? huge_page : sys_page;
+
+                            uint64_t cb_size = sizeof(ControlBlock);
+                            uint64_t payload_offset = detail::align_up(cb_size, alignof(T));
+                            uint64_t init_sz = detail::align_up(payload_offset + sizeof(T), target_page_size);
+
+                            if (ftruncate(this->fd_, static_cast<int64_t>(init_sz)) != 0) {
+                                diag::write("ERROR", "Mount", "初始 ftruncate 失败");
+                                break;
+                            }
+
+                            if (use_huge) {
+                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
+                            } else {
+                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
+                            }
+
                             try {
                                 temp_cb->extend_lock.init();
                             } catch (const std::exception& e) {
@@ -391,25 +410,8 @@ namespace ipc {
                                 break; // 跳出，执行 munmap
                             }
 
-                            auto sys_page = sysconf(_SC_PAGESIZE);
-                            constexpr auto huge_page = 1024 * 1024 * 2;
-                            bool use_huge = (mode == InitMode::ForceLarge);
-
-                            if (use_huge) {
-                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
-                                temp_cb->page_size = huge_page;
-                            } else {
-                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
-                                temp_cb->page_size = sys_page;
-                            }
-
-                            temp_cb->payload_offset = detail::align_up(sizeof(ControlBlock), alignof(T));
-                            auto init_sz = detail::align_up(temp_cb->payload_offset + sizeof(T), temp_cb->page_size);
-
-                            if (ftruncate(this->fd_, static_cast<int64_t>(init_sz)) != 0) {
-                                diag::write("ERROR", "Mount", "初始 ftruncate 失败");
-                                break;
-                            }
+                            temp_cb->page_size = target_page_size;
+                            temp_cb->payload_offset = payload_offset;
                             temp_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
                         } else {
                             diag::write("INFO", "Mount", "[附加者] 等待签名...");
