@@ -17,6 +17,7 @@
 #include <system_error>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 
 // 系统调用头文件
 #include <sys/mman.h>
