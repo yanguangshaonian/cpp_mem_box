@@ -22,7 +22,7 @@ class MyObj : public ipc::shm::Boxed<MyObj> {
 int main(const int argc, char* argv[]) {
 
     auto my_obj = ipc::shm::Box<MyObj>{};
-    my_obj.attach_or_create("my_obj", ipc::shm::InitMode::ForceSmall);
+    my_obj.attach_or_create("my_obj");
     my_obj->grow_storage(sizeof(MyObj));
 
     my_obj->age += 1;

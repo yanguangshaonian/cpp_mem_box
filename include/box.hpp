@@ -367,10 +367,7 @@ namespace ipc {
                 ControlBlock* cb_ = nullptr;
                 T* payload_ = nullptr;
 
-                // [新增] 辅助函数: 解析 smaps 获取真实的物理页大小 (单位: Bytes)
-                // 返回 0 表示未映射或无法读取
                 static size_t get_real_page_size(void* ptr) {
-                    // 仅在 Linux 下有效
                     std::ifstream smaps("/proc/self/smaps");
                     if (!smaps.is_open())
                         return 0;
@@ -380,7 +377,6 @@ namespace ipc {
                     uintptr_t target = reinterpret_cast<uintptr_t>(ptr);
 
                     while (std::getline(smaps, line)) {
-                        // 1. 寻找内存区域头: "7f...-7f... rw-s ..."
                         if (line.find('-') != std::string::npos) {
                             uintptr_t start = 0, end = 0;
                             char dash = 0;
@@ -388,14 +384,14 @@ namespace ipc {
                             ss >> std::hex >> start >> dash >> end;
 
                             if (target >= start && target < end) {
-                                in_region = true; // 找到目标区域
+                                in_region = true;
                             } else {
                                 in_region = false;
                             }
                             continue;
                         }
 
-                        // 2. 在区域内查找 KernelPageSize
+                        // 在区域内查找 KernelPageSize
                         if (in_region && line.find("KernelPageSize:") != std::string::npos) {
                             size_t size_kb = 0;
                             std::string key, unit;
@@ -425,7 +421,7 @@ namespace ipc {
                     snprintf(buf, sizeof(buf), "6. 当前物理容量 (Cap)  : %lu bytes", total_cap);
                     diag::write("INFO", "Layout", buf);
 
-                    // --- 新增: 第 7 行 实际物理检测 ---
+                    // 实际物理检测 ---
                     if (check_ptr != nullptr) {
                         size_t real_bytes = get_real_page_size(check_ptr);
                         std::string status;
@@ -434,7 +430,7 @@ namespace ipc {
                         } else if (real_bytes >= 2ULL * 1024 * 1024) {
                             status = "HUGE (" + std::to_string(real_bytes / 1024) + " kB)";
                         } else {
-                            status = "SMALL (" + std::to_string(real_bytes / 1024) + " kB),系统可能未开启 THP";
+                            status = "SMALL (" + std::to_string(real_bytes / 1024) + " kB), 系统可能未开启 THP";
                         }
 
                         // 格式化输出
@@ -450,7 +446,8 @@ namespace ipc {
                 // 内部函数: 挂载逻辑
                 bool mount_region(bool is_creator, InitMode mode) {
                     diag::write("INFO", "Mount",
-                                ">> 开始映射流程 (Creator: " + std::string(is_creator ? "YES" : "NO") + ")");
+                                ">> 开始映射流程 (Creator: " + std::string(is_creator ? "YES" : "NO") +
+                                    ", Mode: " + std::string(mode == InitMode::ForceLarge ? "Large" : "Small") + ")");
 
                     void* ptr =
                         mmap(nullptr, VIRTUAL_RESERVATION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd_, 0);
@@ -505,25 +502,26 @@ namespace ipc {
                                 break;
                             }
 
+                            if (mode == InitMode::ForceLarge) {
+                                size_t real_bytes = get_real_page_size(ptr);
+                                if (real_bytes > 0 && real_bytes < 2ULL * 1024 * 1024) {
+                                    diag::write("WARN", "Mount",
+                                                "系统拒绝分配大页 (实际 " + std::to_string(real_bytes / 1024) +
+                                                    " kB)。");
+                                    diag::write("WARN", "Mount", ">>> 正在执行回退策略: 重新映射为 4KB 模式 <<<");
+                                    munmap(ptr, VIRTUAL_RESERVATION_SIZE);
+                                    return mount_region(is_creator, InitMode::ForceSmall);
+                                }
+                                diag::write("INFO", "Mount",
+                                            "物理页复核通过: HUGE (" + std::to_string(real_bytes / 1024) + " kB)");
+                            }
+
                             // 写入元数据 (包括 Size/Align 用于校验)
                             t_cb->page_size = target_page;
                             t_cb->payload_offset = expected_offset;
-                            t_cb->element_size = local_size;  
-                            t_cb->element_align = local_align; 
+                            t_cb->element_size = local_size;
+                            t_cb->element_align = local_align;
                             t_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
-
-                            {
-                                size_t real_bytes = get_real_page_size(ptr);
-                                char check_buf[128];
-                                std::string status;
-                                if (real_bytes >= 2ULL * 1024 * 1024) {
-                                    status = "HUGE (" + std::to_string(real_bytes / 1024) + " kB)";
-                                } else {
-                                    status = "SMALL (" + std::to_string(real_bytes / 1024) + " kB), 系统可能未开启 THP";
-                                }
-                                snprintf(check_buf, sizeof(check_buf), "物理页复核: %s", status.c_str());
-                                diag::write(real_bytes >= target_page ? "INFO" : "WARN", "Mount", check_buf);
-                            }
                         } else {
                             diag::write("INFO", "Mount", "[附加者] 等待签名...");
                             auto spins = 0;
