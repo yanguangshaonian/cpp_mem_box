@@ -16,6 +16,7 @@
 #include <type_traits>
 #include <system_error>
 #include <chrono>
+#include <fstream>
 
 // 系统调用头文件
 #include <sys/mman.h>
@@ -210,18 +211,18 @@ namespace ipc {
 
                 void unregister_mapping(uint8_t* base, uint64_t size) {
                     std::unique_lock lock(this->rw_lock_);
-                    uintptr_t end = reinterpret_cast<uintptr_t>(base) + size;
+                    auto end = reinterpret_cast<uintptr_t>(base) + size;
                     this->mappings_.erase(end);
                 }
 
                 __attribute__((always_inline)) inline bool find_mapping_fast(void* ptr, RegionDescriptor* out_desc,
                                                                              RegionDescriptor* cache_hint) {
-                    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+                    auto p = reinterpret_cast<uintptr_t>(ptr);
 
                     // Fast Path: TLS Cache
                     if (cache_hint != nullptr && cache_hint->base != nullptr) {
-                        uintptr_t start = reinterpret_cast<uintptr_t>(cache_hint->base);
-                        uintptr_t end = start + cache_hint->v_size;
+                        auto start = reinterpret_cast<uintptr_t>(cache_hint->base);
+                        auto end = start + cache_hint->v_size;
                         if (p >= start && p < end) {
                             *out_desc = *cache_hint;
                             return true;
@@ -233,7 +234,7 @@ namespace ipc {
                     auto it = this->mappings_.upper_bound(p);
 
                     if (it != this->mappings_.end()) {
-                        uintptr_t base = reinterpret_cast<uintptr_t>(it->second.base);
+                        auto base = reinterpret_cast<uintptr_t>(it->second.base);
                         if (p >= base) {
                             *out_desc = it->second;
                             if (cache_hint != nullptr) {
@@ -257,8 +258,12 @@ namespace ipc {
                 volatile std::atomic<uint64_t> signature; // 文件签名 (Magic)
                 uint64_t page_size;                       // 页对齐大小
                 std::atomic<uint64_t> capacity_bytes;     // 当前提交的物理容量
-                uint64_t payload_offset;                  // 有效载荷偏移量
-                RobustLock extend_lock;                   // 扩容专用锁
+
+                uint64_t payload_offset; // T 的起始偏移
+                uint64_t element_size;   // sizeof(T)
+                uint64_t element_align;  // alignof(T)
+
+                RobustLock extend_lock; // 扩容专用锁
         };
 
         // ------------------------------------------------------------
@@ -362,92 +367,247 @@ namespace ipc {
                 ControlBlock* cb_ = nullptr;
                 T* payload_ = nullptr;
 
-                // 内部函数: 挂载逻辑 (事务性修复版)
-                bool mount_region(bool is_creator, InitMode mode) {
-                    diag::write("INFO", "Mount", "映射虚拟地址空间...");
-                    // 使用局部变量持有资源, 防止污染 this->base_
-                    void* temp_ptr =
-                        mmap(nullptr, VIRTUAL_RESERVATION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd_, 0);
+                // [新增] 辅助函数: 解析 smaps 获取真实的物理页大小 (单位: Bytes)
+                // 返回 0 表示未映射或无法读取
+                static size_t get_real_page_size(void* ptr) {
+                    // 仅在 Linux 下有效
+                    std::ifstream smaps("/proc/self/smaps");
+                    if (!smaps.is_open())
+                        return 0;
 
-                    if (temp_ptr == MAP_FAILED) {
+                    std::string line;
+                    bool in_region = false;
+                    uintptr_t target = reinterpret_cast<uintptr_t>(ptr);
+
+                    while (std::getline(smaps, line)) {
+                        // 1. 寻找内存区域头: "7f...-7f... rw-s ..."
+                        if (line.find('-') != std::string::npos) {
+                            uintptr_t start = 0, end = 0;
+                            char dash = 0;
+                            std::stringstream ss(line);
+                            ss >> std::hex >> start >> dash >> end;
+
+                            if (target >= start && target < end) {
+                                in_region = true; // 找到目标区域
+                            } else {
+                                in_region = false;
+                            }
+                            continue;
+                        }
+
+                        // 2. 在区域内查找 KernelPageSize
+                        if (in_region && line.find("KernelPageSize:") != std::string::npos) {
+                            size_t size_kb = 0;
+                            std::string key, unit;
+                            std::stringstream ss(line);
+                            ss >> key >> size_kb >> unit;
+                            return size_kb * 1024; // 转为 Bytes
+                        }
+                    }
+                    return 0;
+                }
+
+                void log_layout_table(const char* role, uint64_t cb_sz, uint64_t align, uint64_t size, uint64_t offset,
+                                      uint64_t page, uint64_t total_cap, void* check_ptr = nullptr) {
+
+                    diag::write("INFO", "Layout", std::string("--- [") + role + "] 内存布局详情 ---");
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "1. 控制块大小 (Header) : %lu bytes", cb_sz);
+                    diag::write("INFO", "Layout", buf);
+                    snprintf(buf, sizeof(buf), "2. 对象对齐 (Align)    : %lu bytes", align);
+                    diag::write("INFO", "Layout", buf);
+                    snprintf(buf, sizeof(buf), "3. 对象大小 (Size)     : %lu bytes", size);
+                    diag::write("INFO", "Layout", buf);
+                    snprintf(buf, sizeof(buf), "4. 载荷偏移 (Offset)   : %lu bytes", offset);
+                    diag::write("INFO", "Layout", buf);
+                    snprintf(buf, sizeof(buf), "5. 页大小 (配置/Page)  : %lu bytes", page);
+                    diag::write("INFO", "Layout", buf);
+                    snprintf(buf, sizeof(buf), "6. 当前物理容量 (Cap)  : %lu bytes", total_cap);
+                    diag::write("INFO", "Layout", buf);
+
+                    // --- 新增: 第 7 行 实际物理检测 ---
+                    if (check_ptr != nullptr) {
+                        size_t real_bytes = get_real_page_size(check_ptr);
+                        std::string status;
+                        if (real_bytes == 0) {
+                            status = "未知/未分配 (Unknown)";
+                        } else if (real_bytes >= 2ULL * 1024 * 1024) {
+                            status = "HUGE (" + std::to_string(real_bytes / 1024) + " kB)";
+                        } else {
+                            status = "SMALL (" + std::to_string(real_bytes / 1024) + " kB),系统可能未开启 THP";
+                        }
+
+                        // 格式化输出
+                        snprintf(buf, sizeof(buf), "7. 实际物理页 (Real)   : %s", status.c_str());
+                        diag::write(real_bytes >= page ? "INFO" : "WARN", "Layout", buf);
+                    } else {
+                        diag::write("INFO", "Layout", "7. 实际物理页 (Real)   : [规划阶段/暂未检测]");
+                    }
+
+                    diag::write("INFO", "Layout", "----------------------------------");
+                }
+
+                // 内部函数: 挂载逻辑
+                bool mount_region(bool is_creator, InitMode mode) {
+                    diag::write("INFO", "Mount",
+                                ">> 开始映射流程 (Creator: " + std::string(is_creator ? "YES" : "NO") + ")");
+
+                    void* ptr =
+                        mmap(nullptr, VIRTUAL_RESERVATION_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, this->fd_, 0);
+                    if (ptr == MAP_FAILED) {
                         diag::write("ERROR", "Mount", "mmap 失败: " + std::string(strerror(errno)));
                         return false;
                     }
 
-                    uint8_t* temp_base = static_cast<uint8_t*>(temp_ptr);
-                    auto* temp_cb = reinterpret_cast<ControlBlock*>(temp_base);
-                    bool success = false;
+                    // 打印调试用基地址
+                    char addr_buf[64];
+                    snprintf(addr_buf, sizeof(addr_buf), "虚拟基址: %p", ptr);
+                    diag::write("INFO", "Mount", addr_buf);
 
-                    // 使用 do-while(0) 结构统一管理错误跳出
+                    auto* t_cb = reinterpret_cast<ControlBlock*>(ptr);
+                    auto success = false;
+
+                    // 本地预计算的期望值
+                    const auto local_size = sizeof(T);
+                    const auto local_align = alignof(T);
+                    const auto cb_size = sizeof(ControlBlock);
+                    const auto expected_offset = detail::align_up(cb_size, local_align);
+
                     do {
                         if (is_creator) {
-                            diag::write("INFO", "Mount", "[创建者] 初始化控制块...");
-
+                            // --- [创建者路径] ---
                             auto sys_page = sysconf(_SC_PAGESIZE);
-                            constexpr auto huge_page = 1024 * 1024 * 2; // 2MB
-                            bool use_huge = (mode == InitMode::ForceLarge);
-                            uint64_t target_page_size = use_huge ? huge_page : sys_page;
+                            auto target_page = (mode == InitMode::ForceLarge) ? (2ULL * 1024 * 1024) : sys_page;
+                            auto init_sz = detail::align_up(expected_offset + local_size, target_page);
 
-                            uint64_t cb_size = sizeof(ControlBlock);
-                            uint64_t payload_offset = detail::align_up(cb_size, alignof(T));
-                            uint64_t init_sz = detail::align_up(payload_offset + sizeof(T), target_page_size);
+                            // 打印详细布局计划
+                            log_layout_table("创建者-规划", cb_size, local_align, local_size, expected_offset,
+                                             target_page, init_sz);
 
-                            if (ftruncate(this->fd_, static_cast<int64_t>(init_sz)) != 0) {
-                                diag::write("ERROR", "Mount", "初始 ftruncate 失败");
+                            // 扩容物理文件
+                            if (ftruncate(this->fd_, static_cast<off_t>(init_sz)) != 0) {
+                                diag::write("ERROR", "Mount", "ftruncate 失败: " + std::string(strerror(errno)));
                                 break;
                             }
 
-                            if (use_huge) {
-                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
+                            // HugePage 设置
+                            if (mode == InitMode::ForceLarge) {
+                                madvise(ptr, VIRTUAL_RESERVATION_SIZE, MADV_HUGEPAGE);
                             } else {
-                                madvise(temp_ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
+                                madvise(ptr, VIRTUAL_RESERVATION_SIZE, MADV_NOHUGEPAGE);
                             }
 
+                            // 初始化锁
                             try {
-                                temp_cb->extend_lock.init();
-                            } catch (const std::exception& e) {
-                                diag::write("ERROR", "Mount", "锁初始化失败... " + std::string(e.what()));
-                                break; // 跳出，执行 munmap
+                                t_cb->extend_lock.init();
+                            } catch (...) {
+                                diag::write("ERROR", "Mount", "锁初始化失败");
+                                break;
                             }
 
-                            temp_cb->page_size = target_page_size;
-                            temp_cb->payload_offset = payload_offset;
-                            temp_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
+                            // 写入元数据 (包括 Size/Align 用于校验)
+                            t_cb->page_size = target_page;
+                            t_cb->payload_offset = expected_offset;
+                            t_cb->element_size = local_size;  
+                            t_cb->element_align = local_align; 
+                            t_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
+
+                            {
+                                size_t real_bytes = get_real_page_size(ptr);
+                                char check_buf[128];
+                                std::string status;
+                                if (real_bytes >= 2ULL * 1024 * 1024) {
+                                    status = "HUGE (" + std::to_string(real_bytes / 1024) + " kB)";
+                                } else {
+                                    status = "SMALL (" + std::to_string(real_bytes / 1024) + " kB), 系统可能未开启 THP";
+                                }
+                                snprintf(check_buf, sizeof(check_buf), "物理页复核: %s", status.c_str());
+                                diag::write(real_bytes >= target_page ? "INFO" : "WARN", "Mount", check_buf);
+                            }
                         } else {
                             diag::write("INFO", "Mount", "[附加者] 等待签名...");
                             auto spins = 0;
-                            while (temp_cb->signature.load(std::memory_order_acquire) != IPC_SHM_SIGNATURE) {
-                                if (spins < 1000)
-                                    _mm_pause();
-                                else if (spins < 3000)
-                                    std::this_thread::yield();
-                                else
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-                                if (spins > 5000) {
-                                    diag::write("ERROR", "Mount", "等待签名超时");
-                                    break;
+                            struct stat st;
+                            bool is_ready = false;
+                            while (spins < 5000) {
+                                if (fstat(this->fd_, &st) == 0 &&
+                                    st.st_size >= static_cast<off_t>(sizeof(ControlBlock))) {
+                                    if (t_cb->signature.load(std::memory_order_acquire) == IPC_SHM_SIGNATURE) {
+                                        is_ready = true;
+                                        break;
+                                    }
                                 }
+
                                 spins += 1;
+                                if (spins < 1000) {
+                                    _mm_pause();
+                                } else if (spins < 2000) {
+                                    std::this_thread::yield();
+                                } else {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                                }
                             }
-                            if (temp_cb->signature.load(std::memory_order_relaxed) != IPC_SHM_SIGNATURE) {
-                                break;
+
+                            if (!is_ready) {
+                                diag::write("ERROR", "Mount", "等待超时 (Creator 未完成初始化或崩溃)");
+                                break; // 失败，跳出 do-while
                             }
+
+                            // 读取共享内存中的元数据
+                            auto remote_size = t_cb->element_size;
+                            auto remote_align = t_cb->element_align;
+                            auto remote_offset = t_cb->payload_offset;
+                            auto remote_cap = t_cb->capacity_bytes.load(std::memory_order_relaxed);
+                            auto remote_page = t_cb->page_size;
+
+                            // 打印读取到的布局
+                            log_layout_table("附加者-读取", cb_size, remote_align, remote_size, remote_offset,
+                                             remote_page, remote_cap, ptr);
+
+                            // 严格检查 T 的定义是否改变
+                            bool mismatch = false;
+
+                            if (remote_size != local_size) {
+                                diag::write("ERROR", "SchemaCheck",
+                                            "对象大小不匹配! SHM中: " + std::to_string(remote_size) +
+                                                ", 本地T: " + std::to_string(local_size));
+                                mismatch = true;
+                            }
+
+                            if (remote_align != local_align) {
+                                diag::write("ERROR", "SchemaCheck",
+                                            "对象对齐不匹配! SHM中: " + std::to_string(remote_align) +
+                                                ", 本地T: " + std::to_string(local_align));
+                                mismatch = true;
+                            }
+
+                            if (remote_offset != expected_offset) {
+                                diag::write("ERROR", "SchemaCheck",
+                                            "偏移量计算不一致! 可能是 ControlBlock 定义改变或对齐规则不同。SHM中: " +
+                                                std::to_string(remote_offset) +
+                                                ", 本地计算: " + std::to_string(expected_offset));
+                                mismatch = true;
+                            }
+
+                            if (mismatch) {
+                                diag::write("ERROR", "Mount",
+                                            "检测到严重的二进制布局冲突 (ABI Mismatch)，禁止 Attach!");
+                                break; // 失败退出
+                            }
+
+                            diag::write("INFO", "Mount", "布局校验通过 (Schema Validated)");
                         }
                         success = true;
                     } while (false);
 
                     if (!success) {
-                        // 事务回滚: 释放刚才申请的 mmap
-                        munmap(temp_base, VIRTUAL_RESERVATION_SIZE);
+                        munmap(ptr, VIRTUAL_RESERVATION_SIZE);
                         return false;
                     }
 
-                    // 事务提交: 一切成功后, 才赋值给成员变量
-                    this->base_ = temp_base;
-                    this->cb_ = temp_cb;
+                    this->base_ = static_cast<uint8_t*>(ptr);
+                    this->cb_ = t_cb;
                     this->payload_ = reinterpret_cast<T*>(this->base_ + this->cb_->payload_offset);
-
                     MappingRegistry::instance().register_mapping(this->base_, VIRTUAL_RESERVATION_SIZE, this->fd_);
                     return true;
                 }
@@ -459,57 +619,70 @@ namespace ipc {
                 template<typename... Args>
                 bool attach_or_create(const std::string& name, InitMode mode = InitMode::ForceLarge, Args&&... args) {
                     if (this->fd_ >= 0 || this->base_ != nullptr) {
-                        diag::write("ERROR", "Box", "Box 已经处于 Open 状态，请先析构或重置");
+                        diag::write("ERROR", "Box", "API误用: 实例已处于 Open 状态 (FD/Base非空)，请先析构或重置");
                         return false;
                     }
                     this->name_ = name;
-                    bool is_creator = false;
+                    auto is_creator = false;
 
-                    diag::write("INFO", "Box", "打开共享对象: " + this->name_);
+                    diag::write("INFO", "Box", ">> 请求访问共享对象: [" + this->name_ + "]");
 
                     // 尝试原子创建
                     this->fd_ = shm_open(this->name_.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0660);
                     if (this->fd_ >= 0) {
                         is_creator = true;
-                        diag::write("INFO", "Box", "原子创建成功 (Owner)");
+                        diag::write("INFO", "Box", "模式: 创建者 (Owner) | FD: " + std::to_string(this->fd_));
                     } else if (errno == EEXIST) {
-                        diag::write("WARN", "Box", "对象已存在, 尝试 Attach...");
+                        diag::write("WARN", "Box", "模式: 附加者 (Attacher) - 检测到对象已存在");
                         this->fd_ = shm_open(this->name_.c_str(), O_RDWR | O_CLOEXEC, 0660);
                         if (this->fd_ < 0) {
-                            diag::write("ERROR", "Box", "Attach 失败: " + std::string(strerror(errno)));
+                            diag::write("ERROR", "Box", "Attach 失败 (shm_open): " + std::string(strerror(errno)));
                             return false;
                         }
-                        diag::write("INFO", "Box", "Attach 句柄打开成功");
+                        diag::write("INFO", "Box", "句柄打开成功 | FD: " + std::to_string(this->fd_));
                     } else {
                         diag::write("ERROR", "Box", "shm_open 致命错误: " + std::string(strerror(errno)));
                         return false;
                     }
 
                     if (!mount_region(is_creator, mode)) {
+                        diag::write("ERROR", "Box", "内存映射失败，正在回滚资源...");
                         close(this->fd_);
                         this->fd_ = -1;
                         if (is_creator) {
                             shm_unlink(this->name_.c_str());
+                            diag::write("WARN", "Box", "已清理残留的共享内存文件");
                         }
                         return false;
                     }
 
                     if (is_creator) {
+                        diag::write("INFO", "Box", "正在构造 Payload 对象...");
                         try {
                             new (this->payload_) T(std::forward<Args>(args)...);
-                        } catch (const std::exception& e) {
-                            diag::write("ERROR", "Box", "Payload 构造异常(std): " + std::string(e.what()));
-                            shm_unlink(this->name_.c_str());
-                            throw;
                         } catch (...) {
-                            diag::write("ERROR", "Box", "Payload 构造异常(unknown)!");
+                            diag::write("FATAL", "Box", "Payload 构造抛出异常，执行彻底清理!");
+                            if (this->base_ != nullptr) {
+                                MappingRegistry::instance().unregister_mapping(this->base_, VIRTUAL_RESERVATION_SIZE);
+                                munmap(this->base_, VIRTUAL_RESERVATION_SIZE);
+                                this->base_ = nullptr;
+                            }
+                            if (this->fd_ >= 0) {
+                                close(this->fd_);
+                                this->fd_ = -1;
+                            }
+                            this->cb_ = nullptr;
+                            this->payload_ = nullptr;
+
                             shm_unlink(this->name_.c_str());
                             throw;
                         }
 
                         std::atomic_thread_fence(std::memory_order_release);
                         this->cb_->signature.store(IPC_SHM_SIGNATURE, std::memory_order_release);
-                        diag::write("INFO", "Box", "Payload 构造完成, 服务已发布 (Signature Written)");
+                        diag::write("INFO", "Box", "<<< 服务已就绪 (Signature Published) >>>");
+                    } else {
+                        diag::write("INFO", "Box", "<<< 连接已建立 (Attached Successfully) >>>");
                     }
                     return true;
                 }
