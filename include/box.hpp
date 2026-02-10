@@ -18,15 +18,13 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
-
-// 系统调用头文件
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <pthread.h>
-#include <emmintrin.h> // for _mm_pause
+#include <emmintrin.h>
 
 namespace ipc {
     // ----------------------------------------------------------------
