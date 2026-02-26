@@ -84,7 +84,7 @@ namespace ipc {
             // while (log_spinlock.test_and_set(std::memory_order_acquire)) {
             //     _mm_pause();
             // }
-            ssize_t ignored = ::write(STDOUT_FILENO, buffer, len);
+            auto ignored = ::write(STDOUT_FILENO, buffer, len);
             (void) ignored;
             log_spinlock.clear(std::memory_order_release);
         }
@@ -462,7 +462,7 @@ namespace ipc {
 
                     // 实际物理检测 ---
                     if (check_ptr != nullptr) {
-                        size_t real_bytes = get_real_page_size(check_ptr);
+                        auto real_bytes = get_real_page_size(check_ptr);
                         std::string status;
                         if (real_bytes == 0) {
                             status = "未知/未分配 (Unknown)";
@@ -542,7 +542,7 @@ namespace ipc {
                             }
 
                             if (mode == InitMode::ForceLarge) {
-                                size_t real_bytes = get_real_page_size(ptr);
+                                auto real_bytes = get_real_page_size(ptr);
                                 if (real_bytes > 0 && real_bytes < 2ULL * 1024 * 1024) {
                                     diag::write("WARN", "Mount",
                                                 "系统拒绝分配大页 (实际 " + std::to_string(real_bytes / 1024) +
