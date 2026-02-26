@@ -323,6 +323,11 @@ namespace ipc {
                 void operator delete(void*) = delete;
                 void operator delete[](void*) = delete;
 
+                Boxed(const Boxed&) = delete;
+                Boxed(Boxed&&) = delete;
+                Boxed& operator=(const Boxed&) = delete;
+                Boxed& operator=(Boxed&&) = delete;
+
                 // Placement New (Box 专用通道)
                 void* operator new(size_t, void* ptr) {
                     return ptr;
@@ -341,15 +346,16 @@ namespace ipc {
         // ------------------------------------------------------------
         template<class T>
         class Box {
-                static_assert(std::is_trivially_copyable_v<T>, "T 必须可以安全的复制");
+                static_assert(std::is_standard_layout_v<T> && std::is_trivially_destructible_v<T>,
+                              "T 必须是标准内存布局且可平凡析构 (安全的共享内存对象)");
                 static_assert(std::is_base_of_v<Boxed<T>, T>, "Box<T>: T 必须继承自 ipc::shm::Boxed<T>");
 
             private:
                 std::string name_;
                 int32_t fd_ = -1;
-                uint8_t* base_ = nullptr;
-                ControlBlock* cb_ = nullptr;
-                T* payload_ = nullptr;
+                uint8_t* base_ = nullptr;    // mmap的基地址
+                ControlBlock* cb_ = nullptr; // 其实也是基地址开头就强转的
+                T* payload_ = nullptr;       // T对象的实际地址 (base + payload_offset)
 
                 static size_t get_real_page_size(void* ptr) {
                     std::ifstream smaps("/proc/self/smaps");
@@ -445,7 +451,7 @@ namespace ipc {
                     snprintf(addr_buf, sizeof(addr_buf), "虚拟基址: %p", ptr);
                     diag::write("INFO", "Mount", addr_buf);
 
-                    auto* t_cb = reinterpret_cast<ControlBlock*>(ptr);
+                    auto* tmp_cb = reinterpret_cast<ControlBlock*>(ptr);
                     auto success = false;
 
                     // 本地预计算的期望值
@@ -480,7 +486,7 @@ namespace ipc {
 
                             // 初始化锁
                             try {
-                                t_cb->extend_lock.init();
+                                tmp_cb->extend_lock.init();
                             } catch (...) {
                                 diag::write("ERROR", "Mount", "锁初始化失败");
                                 break;
@@ -493,6 +499,11 @@ namespace ipc {
                                                 "系统拒绝分配大页 (实际 " + std::to_string(real_bytes / 1024) +
                                                     " kB)。");
                                     diag::write("WARN", "Mount", ">>> 正在执行回退策略: 重新映射为 4KB 模式 <<<");
+                                    // // 语义清晰, 这里提前干净的释放文件大小
+                                    // auto small_sz = detail::align_up(expected_offset + local_size, sys_page);
+                                    // ftruncate(this->fd_, static_cast<off_t>(small_sz));
+                                    // 算了, 还是让递归进来重新设置一样的
+
                                     munmap(ptr, VIRTUAL_RESERVATION_SIZE);
                                     return mount_region(is_creator, InitMode::ForceSmall);
                                 }
@@ -501,11 +512,11 @@ namespace ipc {
                             }
 
                             // 写入元数据 (包括 Size/Align 用于校验)
-                            t_cb->page_size = target_page;
-                            t_cb->payload_offset = expected_offset;
-                            t_cb->element_size = local_size;
-                            t_cb->element_align = local_align;
-                            t_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
+                            tmp_cb->page_size = target_page;
+                            tmp_cb->payload_offset = expected_offset;
+                            tmp_cb->element_size = local_size;
+                            tmp_cb->element_align = local_align;
+                            tmp_cb->capacity_bytes.store(init_sz, std::memory_order_relaxed);
                         } else {
                             diag::write("INFO", "Mount", "[附加者] 等待签名...");
                             auto spins = 0;
@@ -514,7 +525,7 @@ namespace ipc {
                             while (spins < 5000) {
                                 if (fstat(this->fd_, &st) == 0 &&
                                     st.st_size >= static_cast<off_t>(sizeof(ControlBlock))) {
-                                    if (t_cb->signature.load(std::memory_order_acquire) == IPC_SHM_SIGNATURE) {
+                                    if (tmp_cb->signature.load(std::memory_order_acquire) == IPC_SHM_SIGNATURE) {
                                         is_ready = true;
                                         break;
                                     }
@@ -536,11 +547,11 @@ namespace ipc {
                             }
 
                             // 读取共享内存中的元数据
-                            auto remote_size = t_cb->element_size;
-                            auto remote_align = t_cb->element_align;
-                            auto remote_offset = t_cb->payload_offset;
-                            auto remote_cap = t_cb->capacity_bytes.load(std::memory_order_relaxed);
-                            auto remote_page = t_cb->page_size;
+                            auto remote_size = tmp_cb->element_size;
+                            auto remote_align = tmp_cb->element_align;
+                            auto remote_offset = tmp_cb->payload_offset;
+                            auto remote_cap = tmp_cb->capacity_bytes.load(std::memory_order_relaxed);
+                            auto remote_page = tmp_cb->page_size;
 
                             // 打印读取到的布局
                             log_layout_table("附加者-读取", cb_size, remote_align, remote_size, remote_offset,
@@ -588,7 +599,7 @@ namespace ipc {
                     }
 
                     this->base_ = static_cast<uint8_t*>(ptr);
-                    this->cb_ = t_cb;
+                    this->cb_ = tmp_cb;
                     this->payload_ = reinterpret_cast<T*>(this->base_ + this->cb_->payload_offset);
                     MappingRegistry::instance().register_mapping(this->base_, VIRTUAL_RESERVATION_SIZE, this->fd_);
                     return true;
