@@ -261,7 +261,7 @@ namespace ipc {
                     RegionDescriptor desc;
                     // 查找指针所属区域
                     if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc)) {
-                        diag::write("ERROR", "Committer", "Commit失败: 指针未受管辖");
+                        diag::write("ERROR", "CapacityManager", "Grow失败: 指针未受管辖");
                         return false;
                     }
 
@@ -286,11 +286,11 @@ namespace ipc {
                     auto align = cb->page_size != 0 ? cb->page_size : 4096;
                     auto new_cap = detail::align_up(total_needed, align);
 
-                    diag::write("INFO", "Committer",
+                    diag::write("INFO", "CapacityManager",
                                 "扩展物理内存: " + std::to_string(current_cap) + " -> " + std::to_string(new_cap));
 
                     if (ftruncate(desc.fd, static_cast<off_t>(new_cap)) != 0) {
-                        diag::write("ERROR", "Committer", "ftruncate 失败: " + std::string(strerror(errno)));
+                        diag::write("ERROR", "CapacityManager", "ftruncate 扩容失败: " + std::string(strerror(errno)));
                         return false;
                     }
 
@@ -302,7 +302,7 @@ namespace ipc {
                 static __attribute__((always_inline)) inline bool shrink(void* payload_ptr, uint64_t target_bytes) {
                     RegionDescriptor desc;
                     if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc)) {
-                        diag::write("ERROR", "Shrinker", "Shrink失败: 指针未受管辖");
+                        diag::write("ERROR", "CapacityManager", "Shrink失败: 指针未受管辖");
                         return false;
                     }
 
@@ -326,7 +326,7 @@ namespace ipc {
                         return true;
                     }
 
-                    diag::write("INFO", "Shrinker",
+                    diag::write("INFO", "CapacityManager",
                                 "缩减物理内存: " + std::to_string(current_cap) + " -> " + std::to_string(new_cap));
 
                     // 限制无锁读者的可视范围
@@ -335,7 +335,7 @@ namespace ipc {
                     // 物理截断
                     if (ftruncate(desc.fd, static_cast<off_t>(new_cap)) != 0) {
                         // 如果底层系统调用失败，回滚容量元数据
-                        diag::write("ERROR", "Shrinker", "ftruncate 缩容失败: " + std::string(strerror(errno)));
+                        diag::write("ERROR", "CapacityManager", "ftruncate 缩容失败: " + std::string(strerror(errno)));
                         cb->capacity_bytes.store(current_cap, std::memory_order_release);
                         return false;
                     }
