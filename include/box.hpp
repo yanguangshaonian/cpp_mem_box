@@ -249,15 +249,15 @@ namespace ipc {
                 uint64_t element_size;   // sizeof(T)
                 uint64_t element_align;  // alignof(T)
 
-                RobustLock extend_lock; // 扩容专用锁
+                RobustLock capacity_lock; // 扩容专用锁
         };
 
         // ------------------------------------------------------------
         // 物理页提交器 (Page Committer)
         // ------------------------------------------------------------
-        class PageCommitter {
+        class CapacityManager {
             public:
-                static __attribute__((always_inline)) inline bool commit(void* payload_ptr, uint64_t required_bytes) {
+                static __attribute__((always_inline)) inline bool grow(void* payload_ptr, uint64_t required_bytes) {
                     RegionDescriptor desc;
                     // 查找指针所属区域
                     if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc)) {
@@ -274,7 +274,7 @@ namespace ipc {
                     }
 
                     // 加锁扩容
-                    RobustLock::ScopedGuard guard(&cb->extend_lock);
+                    RobustLock::ScopedGuard guard(&cb->capacity_lock);
 
                     // Double Check
                     auto current_cap = cb->capacity_bytes.load(std::memory_order_relaxed);
@@ -298,12 +298,56 @@ namespace ipc {
                     cb->capacity_bytes.store(new_cap, std::memory_order_release);
                     return true;
                 }
+
+                static __attribute__((always_inline)) inline bool shrink(void* payload_ptr, uint64_t target_bytes) {
+                    RegionDescriptor desc;
+                    if (!MappingRegistry::instance().find_mapping_fast(payload_ptr, &desc)) {
+                        diag::write("ERROR", "Shrinker", "Shrink失败: 指针未受管辖");
+                        return false;
+                    }
+
+                    auto* cb = reinterpret_cast<ControlBlock*>(desc.base);
+                    auto total_target = cb->payload_offset + target_bytes;
+
+                    // 无锁快速检查
+                    if (cb->capacity_bytes.load(std::memory_order_acquire) <= total_target) {
+                        return true;
+                    }
+
+                    // 加锁保护 ftruncate 与元数据的修改
+                    RobustLock::ScopedGuard guard(&cb->capacity_lock);
+
+                    auto current_cap = cb->capacity_bytes.load(std::memory_order_relaxed);
+                    auto align = cb->page_size != 0 ? cb->page_size : 4096;
+                    auto new_cap = detail::align_up(total_target, align);
+
+                    // Double check
+                    if (new_cap >= current_cap) {
+                        return true;
+                    }
+
+                    diag::write("INFO", "Shrinker",
+                                "缩减物理内存: " + std::to_string(current_cap) + " -> " + std::to_string(new_cap));
+
+                    // 限制无锁读者的可视范围
+                    cb->capacity_bytes.store(new_cap, std::memory_order_release);
+
+                    // 物理截断
+                    if (ftruncate(desc.fd, static_cast<off_t>(new_cap)) != 0) {
+                        // 如果底层系统调用失败，回滚容量元数据
+                        diag::write("ERROR", "Shrinker", "ftruncate 缩容失败: " + std::string(strerror(errno)));
+                        cb->capacity_bytes.store(current_cap, std::memory_order_release);
+                        return false;
+                    }
+
+                    return true;
+                }
         };
 
         // ------------------------------------------------------------
         // 共享对象基类 (CRTP)
         // ------------------------------------------------------------
-        template<typename Derived>
+        template<class Derived>
         class Boxed {
             protected:
                 Boxed() {
@@ -335,9 +379,14 @@ namespace ipc {
 
                 void operator delete(void*, void*) {}
 
-                // 自我扩容
+                // 扩容
                 __attribute__((always_inline)) inline bool grow_storage(uint64_t bytes_needed) {
-                    return PageCommitter::commit(static_cast<Derived*>(this), bytes_needed);
+                    return CapacityManager::grow(static_cast<Derived*>(this), bytes_needed);
+                }
+
+                // 缩减
+                __attribute__((always_inline)) inline bool shrink_storage(uint64_t target_bytes) {
+                    return CapacityManager::shrink(static_cast<Derived*>(this), target_bytes);
                 }
         };
 
@@ -486,7 +535,7 @@ namespace ipc {
 
                             // 初始化锁
                             try {
-                                tmp_cb->extend_lock.init();
+                                tmp_cb->capacity_lock.init();
                             } catch (...) {
                                 diag::write("ERROR", "Mount", "锁初始化失败");
                                 break;
@@ -609,7 +658,7 @@ namespace ipc {
                 // --------------------------------------------------------
                 // API: 创建或连接 (Attach or Create)
                 // --------------------------------------------------------
-                template<typename... Args>
+                template<class... Args>
                 bool attach_or_create(const std::string& name, InitMode mode = InitMode::ForceLarge, Args&&... args) {
                     if (this->fd_ >= 0 || this->base_ != nullptr) {
                         diag::write("ERROR", "Box", "API误用: 实例已处于 Open 状态 (FD/Base非空)，请先析构或重置");
@@ -716,7 +765,7 @@ namespace ipc {
 namespace ipc {
 namespace shm {
 
-    template <typename T>
+    template <class T>
     class ShmHandle {
     private:
         T* ptr_; // 仅持有一个指针, sizeof(ShmHandle) == 8 bytes
