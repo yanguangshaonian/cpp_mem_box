@@ -353,7 +353,9 @@ namespace ipc {
                 Boxed() {
                     RegionDescriptor desc;
                     if (!MappingRegistry::instance().find_mapping_fast(this, &desc)) {
-                        diag::write("ERROR", "ShmBase", "对象未位于托管的共享内存区域内");
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "对象未位于托管的共享内存区域内, 当前地址=%p", this);
+                        diag::write("DEBUG", "Boxed", buf);
                         std::abort();
                     }
                 }
